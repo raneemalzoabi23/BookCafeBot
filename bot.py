@@ -14,7 +14,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 OWNER_ID = int(os.environ["OWNER_ID"])
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
