@@ -72,7 +72,7 @@ def save_state(state):
     save_json(STATE_FILE, state)
 
 def _part_number(path: Path):
-    m = re.search(r"part_(\d+)", path.stem)
+    m = re.search(r"part[-_](\d+)", path.stem)
     return int(m.group(1)) if m else None
 
 def get_all_part_files():
