@@ -66,7 +66,7 @@ def save_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_state():
-    return load_json(STATE_FILE, {"next_part_index": 1, "active_polls": {}})
+    return load_json(STATE_FILE, {"next_part_index": 1, "active_polls": {}, "skip_next_auto_send": False})
 
 def save_state(state):
     save_json(STATE_FILE, state)
@@ -236,6 +236,12 @@ async def set_livestream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم تحديث نص تذكير البث المباشر ✅")
 
 async def send_part_job(context: ContextTypes.DEFAULT_TYPE):
+    state = get_state()
+    if state.get("skip_next_auto_send"):
+        state["skip_next_auto_send"] = False
+        save_state(state)
+        await notify_owner(context, "⏭️ تم تخطي الإرسال التلقائي المجدول لهذا اليوم بناءً على طلبك.")
+        return
     await do_send_part(context)
 
 async def send_poll_job(context: ContextTypes.DEFAULT_TYPE):
@@ -258,6 +264,16 @@ async def skip_part(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["next_part_index"] += 1
     save_state(state)
     await update.message.reply_text(f"تم التخطي. الجزء القادم الآن: {state['next_part_index']}")
+
+async def skip_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    state = get_state()
+    state["skip_next_auto_send"] = True
+    save_state(state)
+    await update.message.reply_text(
+        "تم إلغاء الإرسال التلقائي القادم اليوم. سيتم إرسال الجزء التالي في موعده المعتاد غدًا."
+    )
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
@@ -302,6 +318,7 @@ def main():
     app.add_handler(CommandHandler("send_now", send_now))
     app.add_handler(CommandHandler("poll_now", poll_now))
     app.add_handler(CommandHandler("skip_part", skip_part))
+    app.add_handler(CommandHandler("skip_today", skip_today))
     app.add_handler(CommandHandler("reminder_now", reminder_now))
     app.add_handler(CommandHandler("set_livestream", set_livestream))
     app.add_handler(CommandHandler("report", report))
