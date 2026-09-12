@@ -8,14 +8,28 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, PollAnswerHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
+
+
+def parse_chat_id(raw: str):
+    """Accepts '@groupusername' as-is, or converts a numeric group id
+    (e.g. '-1001234567890') to an int."""
+    raw = raw.strip()
+    if raw.startswith("@"):
+        return raw
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+GROUP_ID = parse_chat_id(os.environ["GROUP_ID"])
+
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
 POLL_TIME = os.environ.get("POLL_TIME", "20:00")
@@ -31,10 +45,12 @@ BASE_DIR = Path(__file__).parent
 PARTS_DIR = BASE_DIR / "parts"
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 STATE_FILE = DATA_DIR / "state.json"
 RESPONSES_FILE = DATA_DIR / "responses.json"
 REMINDER_FILE = DATA_DIR / "livestream_reminder.txt"
+
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".oga"}
+MAX_FILE_MB = 49  # Telegram bots can't upload files larger than ~50MB
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -49,21 +65,6 @@ def load_json(path, default):
 def save_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def get_subscribers():
-    return load_json(SUBSCRIBERS_FILE, [])
-
-def add_subscriber(chat_id):
-    subs = get_subscribers()
-    if chat_id not in subs:
-        subs.append(chat_id)
-        save_json(SUBSCRIBERS_FILE, subs)
-
-def remove_subscriber(chat_id):
-    subs = get_subscribers()
-    if chat_id in subs:
-        subs.remove(chat_id)
-        save_json(SUBSCRIBERS_FILE, subs)
-
 def get_state():
     return load_json(STATE_FILE, {"next_part_index": 1, "active_polls": {}})
 
@@ -74,56 +75,75 @@ def _part_number(path: Path):
     m = re.search(r"part_(\d+)", path.stem)
     return int(m.group(1)) if m else None
 
-def get_parts():
-    """Sorted list of files named part_1.txt, part_2.txt, ..."""
-    files = [p for p in PARTS_DIR.glob("part_*.txt") if _part_number(p) is not None]
-    files.sort(key=_part_number)
-    return files
+def get_all_part_files():
+    """Every file in parts/ named like part_1.txt, part_1.pdf, part_1.mp3, ..."""
+    return [p for p in PARTS_DIR.iterdir() if p.is_file() and _part_number(p) is not None]
 
-def find_part(idx):
-    for p in get_parts():
-        if _part_number(p) == idx:
-            return p
-    return None
+def get_day_numbers():
+    return sorted({_part_number(p) for p in get_all_part_files()})
+
+def get_day_files(idx):
+    """All files for a given day, .txt first (used as the message body), then attachments."""
+    files = [p for p in get_all_part_files() if _part_number(p) == idx]
+    order = {".txt": 0, ".pdf": 1}
+    files.sort(key=lambda p: order.get(p.suffix.lower(), 2))
+    return files
 
 # ---------- Arabic text ----------
 
-WELCOME = (
-    "مرحبًا بك في المقهى الثقافي! 📚\n\n"
-    "سيصلك هنا كل يوم جزء جديد من الكتاب لتقرأه، "
-    "ثم استطلاع رأي بسيط لمعرفة مدى تقدمك في القراءة.\n\n"
-    "أرسل /help لعرض الأوامر المتاحة."
+START_TEXT = (
+    "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
+    "مباشرة داخل مجموعة المقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
-GOODBYE = "تم إلغاء اشتراكك. نتمنى رؤيتك قريبًا! 👋 يمكنك الاشتراك مجددًا في أي وقت عبر /start"
-HELP_TEXT = (
-    "الأوامر المتاحة:\n"
-    "/start - الاشتراك في نادي القراءة\n"
-    "/stop - إلغاء الاشتراك\n"
-    "/help - عرض هذه الرسالة"
-)
-POLL_QUESTION = "هل قرأت الجزء الذي تم إرساله اليوم؟"
+POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
-NO_PARTS_LEFT_OWNER = "⚠️ لا توجد أجزاء متبقية لإرسالها. أضف ملفات جديدة في مجلد parts/."
+NO_PARTS_LEFT_OWNER = "⚠️ لا توجد أجزاء متبقية لنشرها. أضف ملفات جديدة في مجلد parts/."
+FILE_TOO_LARGE_OWNER = "⚠️ الملف {name} حجمه أكبر من {limit}MB، لم يتم إرساله. قلل حجم الملف وحاول مرة أخرى."
 DEFAULT_REMINDER_TEXT = "سيتم تحديد تفاصيل موعد ورابط البث المباشر قريبًا. تابعوا هنا للتحديثات."
 REMINDER_HEADER = "🔴 تذكير: هناك بث مباشر لمناقشة الكتاب هذا الأسبوع!\n\n"
 
-# ---------- subscriber-facing handlers ----------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    add_subscriber(update.effective_chat.id)
-    await update.message.reply_text(WELCOME)
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remove_subscriber(update.effective_chat.id)
-    await update.message.reply_text(GOODBYE)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
-
-# ---------- owner-only handlers ----------
+# ---------- helpers ----------
 
 def is_owner(update: Update) -> bool:
     return bool(update.effective_user) and update.effective_user.id == OWNER_ID
+
+async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
+    try:
+        await context.bot.send_message(OWNER_ID, text)
+    except Exception:
+        pass
+
+async def send_file_to_group(context: ContextTypes.DEFAULT_TYPE, path: Path):
+    size_mb = path.stat().st_size / (1024 * 1024)
+    if size_mb > MAX_FILE_MB:
+        await notify_owner(context, FILE_TOO_LARGE_OWNER.format(name=path.name, limit=MAX_FILE_MB))
+        return False
+    ext = path.suffix.lower()
+    data = path.read_bytes()
+    try:
+        if ext == ".pdf":
+            await context.bot.send_document(GROUP_ID, document=data, filename=path.name)
+        elif ext in AUDIO_EXTS:
+            await context.bot.send_audio(
+                GROUP_ID, audio=data, filename=path.name, title=f"جزء {_part_number(path)}"
+            )
+        else:
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"Failed to send {path.name} to group: {e}")
+        await notify_owner(context, f"⚠️ فشل إرسال {path.name} إلى المجموعة.")
+        return False
+
+# ---------- fallback if someone DMs the bot directly ----------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(START_TEXT)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(START_TEXT)
+
+# ---------- owner-only handlers ----------
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -131,54 +151,53 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_state()
     await update.message.reply_text(
         f"الجزء القادم: {state['next_part_index']}\n"
-        f"إجمالي الأجزاء المتوفرة: {len(get_parts())}\n"
-        f"عدد المشتركين: {len(get_subscribers())}"
+        f"إجمالي الأيام المتوفرة: {len(get_day_numbers())}\n"
+        f"المجموعة: {GROUP_ID}"
     )
 
 async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
     state = get_state()
     idx = state["next_part_index"]
-    match = find_part(idx)
-    if not match:
-        try:
-            await context.bot.send_message(OWNER_ID, NO_PARTS_LEFT_OWNER)
-        except Exception:
-            pass
+    files = get_day_files(idx)
+    if not files:
+        await notify_owner(context, NO_PARTS_LEFT_OWNER)
         return
-    text = match.read_text(encoding="utf-8")
-    header = f"📖 جزء اليوم ({idx}):\n\n"
-    subs = get_subscribers()
-    sent = 0
-    for chat_id in subs:
-        try:
-            await context.bot.send_message(chat_id, header + text)
-            sent += 1
-        except Exception as e:
-            log.warning(f"Failed to send part to {chat_id}: {e}")
+
+    text_file = next((f for f in files if f.suffix.lower() == ".txt"), None)
+    attachments = [f for f in files if f.suffix.lower() != ".txt"]
+    header = f"📖 جزء اليوم ({idx})"
+    message = f"{header}:\n\n{text_file.read_text(encoding='utf-8')}" if text_file else header
+
+    try:
+        await context.bot.send_message(GROUP_ID, message)
+    except Exception as e:
+        log.warning(f"Failed to post part to group: {e}")
+        await notify_owner(context, f"⚠️ فشل نشر الجزء {idx} في المجموعة. تأكد أن البوت عضو فيها ولديه صلاحية الإرسال.")
+        return
+
+    for f in attachments:
+        await send_file_to_group(context, f)
+
     state["next_part_index"] = idx + 1
     save_state(state)
-    try:
-        await context.bot.send_message(OWNER_ID, f"✅ تم إرسال الجزء {idx} إلى {sent} مشترك.")
-    except Exception:
-        pass
+    formats = ", ".join(sorted({f.suffix.lower().lstrip(".") for f in files}))
+    await notify_owner(context, f"✅ تم نشر الجزء {idx} ({formats}) في المجموعة.")
 
 async def do_send_poll(context: ContextTypes.DEFAULT_TYPE):
-    subs = get_subscribers()
     state = get_state()
-    poll_ids = {}
-    for chat_id in subs:
-        try:
-            msg = await context.bot.send_poll(
-                chat_id=chat_id,
-                question=POLL_QUESTION,
-                options=POLL_OPTIONS,
-                is_anonymous=False,
-            )
-            poll_ids[str(msg.poll.id)] = {"chat_id": chat_id}
-        except Exception as e:
-            log.warning(f"Failed to send poll to {chat_id}: {e}")
-    state["active_polls"] = poll_ids
-    save_state(state)
+    try:
+        msg = await context.bot.send_poll(
+            chat_id=GROUP_ID,
+            question=POLL_QUESTION,
+            options=POLL_OPTIONS,
+            is_anonymous=False,  # groups allow this, so we can track who answered
+        )
+        state["active_polls"] = {str(msg.poll.id): {"part_index": state["next_part_index"] - 1}}
+        save_state(state)
+        await notify_owner(context, "✅ تم نشر استطلاع القراءة في المجموعة.")
+    except Exception as e:
+        log.warning(f"Failed to post poll to group: {e}")
+        await notify_owner(context, "⚠️ فشل نشر الاستطلاع في المجموعة.")
 
 def get_reminder_text():
     if REMINDER_FILE.exists():
@@ -187,18 +206,12 @@ def get_reminder_text():
 
 async def do_send_reminder(context: ContextTypes.DEFAULT_TYPE):
     message = REMINDER_HEADER + get_reminder_text()
-    subs = get_subscribers()
-    sent = 0
-    for chat_id in subs:
-        try:
-            await context.bot.send_message(chat_id, message)
-            sent += 1
-        except Exception as e:
-            log.warning(f"Failed to send reminder to {chat_id}: {e}")
     try:
-        await context.bot.send_message(OWNER_ID, f"✅ تم إرسال تذكير البث المباشر إلى {sent} مشترك.")
-    except Exception:
-        pass
+        await context.bot.send_message(GROUP_ID, message)
+        await notify_owner(context, "✅ تم نشر تذكير البث المباشر في المجموعة.")
+    except Exception as e:
+        log.warning(f"Failed to post reminder to group: {e}")
+        await notify_owner(context, "⚠️ فشل نشر تذكير البث المباشر في المجموعة.")
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     await do_send_reminder(context)
@@ -259,7 +272,7 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "name": user.full_name,
         "username": user.username,
         "answer": chosen,
-        "part_index": state["next_part_index"] - 1,
+        "part_index": poll_info["part_index"],
     }
     save_json(RESPONSES_FILE, responses)
 
@@ -284,15 +297,14 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("send_now", send_now))
     app.add_handler(CommandHandler("poll_now", poll_now))
     app.add_handler(CommandHandler("skip_part", skip_part))
-    app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("reminder_now", reminder_now))
     app.add_handler(CommandHandler("set_livestream", set_livestream))
+    app.add_handler(CommandHandler("report", report))
     app.add_handler(PollAnswerHandler(poll_answer))
 
     app.job_queue.run_daily(send_part_job, time=parse_hhmm(SEND_TIME))
@@ -302,8 +314,8 @@ def main():
     app.job_queue.run_daily(reminder_job, time=parse_hhmm(REMINDER_TIME), days=(reminder_day_int,))
 
     log.info(
-        "Bot started. Parts at %s, polls at %s, livestream reminder %s at %s (%s)",
-        SEND_TIME, POLL_TIME, REMINDER_DAY, REMINDER_TIME, TIMEZONE,
+        "Bot started. Posting to group %s. Parts at %s, polls at %s, reminder %s at %s (%s)",
+        GROUP_ID, SEND_TIME, POLL_TIME, REMINDER_DAY, REMINDER_TIME, TIMEZONE,
     )
     app.run_polling()
 
