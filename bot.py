@@ -12,8 +12,8 @@ from telegram.ext import Application, CommandHandler, PollAnswerHandler, Context
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+OWNER_ID = int(os.environ["OWNER_ID"].strip())
 
 
 def parse_chat_id(raw: str):
