@@ -174,7 +174,11 @@ def find_faq_answer(query: str):
         for kw in entry.get("keywords", []):
             kw_norm = normalize_ar(kw.strip())
             if kw_norm and kw_norm in query_norm:
-                return entry.get("answer")
+                answer = entry.get("answer", "")
+                if "__CONTACT_PLACEHOLDER__" in answer:
+                    contact = CONTACT_NUMBER or "تواصل مع مسؤول المجموعة"
+                    answer = answer.replace("__CONTACT_PLACEHOLDER__", contact)
+                return answer
     return None
 
 async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
