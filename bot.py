@@ -2,6 +2,7 @@ import os
 import json
 import re
 import logging
+import unicodedata
 from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -95,7 +96,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة المقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعةالمقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -155,13 +156,24 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def load_faq():
     return load_json(FAQ_FILE, [])
 
+ARABIC_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670\u0640]")  # harakat, dagger alef, tatweel
+
+def normalize_ar(text: str) -> str:
+    """Makes Arabic matching forgiving of invisible differences — diacritics,
+    elongation marks, and different Unicode representations of the same
+    visible letter (all common side-effects of mobile keyboards)."""
+    text = unicodedata.normalize("NFKC", text)
+    text = ARABIC_DIACRITICS.sub("", text)
+    return text
+
 def find_faq_answer(query: str):
-    query_norm = query.strip()
+    query_norm = normalize_ar(query.strip())
     if not query_norm:
         return None
     for entry in load_faq():
         for kw in entry.get("keywords", []):
-            if kw.strip() and kw.strip() in query_norm:
+            kw_norm = normalize_ar(kw.strip())
+            if kw_norm and kw_norm in query_norm:
                 return entry.get("answer")
     return None
 
@@ -189,6 +201,7 @@ async def faq_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     log.info(f"faq_watch received: {text!r}")
+    log.info(f"faq_watch normalized: {normalize_ar(text)!r}")
     bot_username = context.bot.username
     mentioned = bool(bot_username) and f"@{bot_username}" in text
     if mentioned:
