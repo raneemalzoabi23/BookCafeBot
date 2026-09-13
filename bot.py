@@ -95,7 +95,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة الميهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعةالمقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -181,16 +181,22 @@ async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(find_faq_answer(query) or FAQ_FALLBACK)
 
-async def mention_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Answers questions when someone @mentions the bot directly in the group."""
+async def faq_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Watches every group message: replies with the FAQ answer if the text
+    mentions the bot (always replies, with fallback) or simply contains a
+    matching keyword (replies only on an actual match, otherwise stays silent)."""
     text = update.message.text or ""
+    if not text:
+        return
     bot_username = context.bot.username
-    if not bot_username or f"@{bot_username}" not in text:
+    mentioned = bool(bot_username) and f"@{bot_username}" in text
+    if mentioned:
+        query = text.replace(f"@{bot_username}", "").strip()
+        await update.message.reply_text(find_faq_answer(query) or FAQ_FALLBACK)
         return
-    query = text.replace(f"@{bot_username}", "").strip()
-    if not query:
-        return
-    await update.message.reply_text(find_faq_answer(query) or FAQ_FALLBACK)
+    answer = find_faq_answer(text)
+    if answer:
+        await update.message.reply_text(answer)
 
 # ---------- owner-only handlers ----------
 
@@ -372,7 +378,7 @@ def main():
     app.add_handler(CommandHandler("set_livestream", set_livestream))
     app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("faq", faq_command))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Entity("mention"), mention_faq))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_watch))
     app.add_handler(PollAnswerHandler(poll_answer))
 
     app.job_queue.run_daily(send_part_job, time=parse_hhmm(SEND_TIME))
