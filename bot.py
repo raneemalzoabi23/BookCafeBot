@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, PollAnswerHandler, ContextTypes
 
 load_dotenv()
 
@@ -40,6 +40,7 @@ DAY_NAME_TO_INT = {
 }
 REMINDER_DAY = os.environ.get("REMINDER_DAY", "friday").lower()
 REMINDER_TIME = os.environ.get("REMINDER_TIME", "20:00")
+CONTACT_NUMBER = os.environ.get("CONTACT_NUMBER", "").strip()
 
 BASE_DIR = Path(__file__).parent
 PARTS_DIR = BASE_DIR / "parts"
@@ -48,6 +49,7 @@ DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 RESPONSES_FILE = DATA_DIR / "responses.json"
 REMINDER_FILE = DATA_DIR / "livestream_reminder.txt"
+FAQ_FILE = BASE_DIR / "faq.json"  # lives in the repo, edited via GitHub like parts/
 
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".oga"}
 MAX_FILE_MB = 49  # Telegram bots can't upload files larger than ~50MB
@@ -93,7 +95,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة المقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعة الميهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -101,6 +103,11 @@ NO_PARTS_LEFT_OWNER = "⚠️ لا توجد أجزاء متبقية لنشرها
 FILE_TOO_LARGE_OWNER = "⚠️ الملف {name} حجمه أكبر من {limit}MB، لم يتم إرساله. قلل حجم الملف وحاول مرة أخرى."
 DEFAULT_REMINDER_TEXT = "سيتم تحديد تفاصيل موعد ورابط البث المباشر قريبًا. تابعوا هنا للتحديثات."
 REMINDER_HEADER = "🔴 تذكير: هناك بث مباشر لمناقشة الكتاب هذا الأسبوع!\n\n"
+FAQ_FALLBACK = (
+    "عذرًا، لم أجد إجابة لسؤالك 🤔\n"
+    + (f"للمزيد من المعلومات تواصل عبر: {CONTACT_NUMBER}" if CONTACT_NUMBER
+       else "يرجى التواصل مع مسؤول المجموعة للمزيد من المعلومات.")
+)
 
 # ---------- helpers ----------
 
@@ -142,6 +149,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT)
+
+# ---------- FAQ ----------
+
+def load_faq():
+    return load_json(FAQ_FILE, [])
+
+def find_faq_answer(query: str):
+    query_norm = query.strip()
+    if not query_norm:
+        return None
+    for entry in load_faq():
+        for kw in entry.get("keywords", []):
+            if kw.strip() and kw.strip() in query_norm:
+                return entry.get("answer")
+    return None
+
+async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text.partition(" ")[2].strip()
+    if not query:
+        faqs = load_faq()
+        if not faqs:
+            await update.message.reply_text("لا توجد أسئلة شائعة مضافة بعد.")
+            return
+        lines = ["📋 الأسئلة الشائعة المتاحة:"]
+        for entry in faqs:
+            if entry.get("keywords"):
+                lines.append(f"- {entry['keywords'][0]}")
+        lines.append("\nللسؤال، اكتب: /faq متبوعًا بسؤالك\nمثال: /faq متى يتم إرسال الجزء اليومي؟")
+        await update.message.reply_text("\n".join(lines))
+        return
+    await update.message.reply_text(find_faq_answer(query) or FAQ_FALLBACK)
+
+async def mention_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answers questions when someone @mentions the bot directly in the group."""
+    text = update.message.text or ""
+    bot_username = context.bot.username
+    if not bot_username or f"@{bot_username}" not in text:
+        return
+    query = text.replace(f"@{bot_username}", "").strip()
+    if not query:
+        return
+    await update.message.reply_text(find_faq_answer(query) or FAQ_FALLBACK)
 
 # ---------- owner-only handlers ----------
 
@@ -322,6 +371,8 @@ def main():
     app.add_handler(CommandHandler("reminder_now", reminder_now))
     app.add_handler(CommandHandler("set_livestream", set_livestream))
     app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("faq", faq_command))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Entity("mention"), mention_faq))
     app.add_handler(PollAnswerHandler(poll_answer))
 
     app.job_queue.run_daily(send_part_job, time=parse_hhmm(SEND_TIME))
