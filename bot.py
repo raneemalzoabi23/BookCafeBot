@@ -96,7 +96,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعةالمقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعة المقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -212,6 +212,8 @@ async def faq_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     answer = find_faq_answer(text)
     log.info(f"faq_watch keyword match: {answer!r}")
+    all_keywords = [kw for e in load_faq() for kw in e.get("keywords", [])]
+    log.info(f"faq_watch loaded keywords: {all_keywords!r}")
     if answer:
         await update.message.reply_text(answer)
 
