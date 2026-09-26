@@ -1,14 +1,15 @@
 import os
 import json
 import re
+import asyncio
 import logging
 import unicodedata
-from datetime import time
+from datetime import time, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, Poll
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, PollAnswerHandler, ContextTypes
 
 load_dotenv()
@@ -34,6 +35,10 @@ GROUP_ID = parse_chat_id(os.environ["GROUP_ID"])
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
 POLL_TIME = os.environ.get("POLL_TIME", "20:00")
+# The date day 1 was (or will be) sent. Day number is computed from today's
+# date relative to this, so progress survives redeploys — nothing is "counted"
+# or stored that could get reset.
+START_DATE = date.fromisoformat(os.environ.get("START_DATE", str(date.today())).strip())
 
 DAY_NAME_TO_INT = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -51,6 +56,7 @@ STATE_FILE = DATA_DIR / "state.json"
 RESPONSES_FILE = DATA_DIR / "responses.json"
 REMINDER_FILE = DATA_DIR / "livestream_reminder.txt"
 FAQ_FILE = BASE_DIR / "faq.json"  # lives in the repo, edited via GitHub like parts/
+QUESTIONS_FILE = BASE_DIR / "questions.json"  # discussion/quiz questions per part
 
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".oga"}
 MAX_FILE_MB = 49  # Telegram bots can't upload files larger than ~50MB
@@ -69,10 +75,17 @@ def save_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_state():
-    return load_json(STATE_FILE, {"next_part_index": 1, "active_polls": {}, "skip_next_auto_send": False})
+    return load_json(STATE_FILE, {"day_offset": 0, "active_polls": {}, "skip_next_auto_send": False})
 
 def save_state(state):
     save_json(STATE_FILE, state)
+
+def get_today_day_index():
+    """Day number is always derived from today's date + START_DATE, plus any
+    manual offset from /skip_part. Never a stored counter, so it can't reset."""
+    today = date.today()
+    state = get_state()
+    return (today - START_DATE).days + 1 + state.get("day_offset", 0)
 
 def _part_number(path: Path):
     m = re.search(r"part[-_](\d+)", path.stem)
@@ -96,7 +109,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة المقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعة النقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -120,6 +133,41 @@ async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
         await context.bot.send_message(OWNER_ID, text)
     except Exception:
         pass
+
+def load_questions():
+    return load_json(QUESTIONS_FILE, [])
+
+def get_questions_for_day(idx):
+    for entry in load_questions():
+        if entry.get("part") == idx:
+            return entry.get("questions", [])
+    return []
+
+async def send_day_questions(context: ContextTypes.DEFAULT_TYPE, idx: int):
+    questions = get_questions_for_day(idx)
+    if not questions:
+        return
+    sent = 0
+    for q in questions:
+        options = [str(o)[:100] for o in q.get("options", [])]
+        correct = q.get("correct_index")
+        if len(options) < 2 or correct is None or correct >= len(options):
+            continue
+        try:
+            await context.bot.send_poll(
+                chat_id=GROUP_ID,
+                question=str(q["question"])[:300],
+                options=options,
+                type=Poll.QUIZ,
+                correct_option_id=correct,
+                is_anonymous=False,
+            )
+            sent += 1
+            await asyncio.sleep(1)  # avoid flooding the group / hitting rate limits
+        except Exception as e:
+            log.warning(f"Failed to send quiz question to group: {e}")
+    if sent:
+        await notify_owner(context, f"📝 تم إرسال {sent} سؤال/أسئلة مراجعة للجزء {idx}.")
 
 async def send_file_to_group(context: ContextTypes.DEFAULT_TYPE, path: Path):
     size_mb = path.stat().st_size / (1024 * 1024)
@@ -226,16 +274,17 @@ async def faq_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    state = get_state()
+    idx = get_today_day_index()
     await update.message.reply_text(
-        f"الجزء القادم: {state['next_part_index']}\n"
+        f"يوم اليوم: {idx}\n"
         f"إجمالي الأيام المتوفرة: {len(get_day_numbers())}\n"
         f"المجموعة: {GROUP_ID}"
     )
 
 async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
-    state = get_state()
-    idx = state["next_part_index"]
+    idx = get_today_day_index()
+    if idx < 1:
+        return  # start date is in the future, nothing to send yet
     files = get_day_files(idx)
     if not files:
         await notify_owner(context, NO_PARTS_LEFT_OWNER)
@@ -256,8 +305,8 @@ async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
     for f in attachments:
         await send_file_to_group(context, f)
 
-    state["next_part_index"] = idx + 1
-    save_state(state)
+    await send_day_questions(context, idx)
+
     formats = ", ".join(sorted({f.suffix.lower().lstrip(".") for f in files}))
     await notify_owner(context, f"✅ تم نشر الجزء {idx} ({formats}) في المجموعة.")
 
@@ -270,7 +319,7 @@ async def do_send_poll(context: ContextTypes.DEFAULT_TYPE):
             options=POLL_OPTIONS,
             is_anonymous=False,  # groups allow this, so we can track who answered
         )
-        state["active_polls"] = {str(msg.poll.id): {"part_index": state["next_part_index"] - 1}}
+        state["active_polls"] = {str(msg.poll.id): {"part_index": get_today_day_index()}}
         save_state(state)
         await notify_owner(context, "✅ تم نشر استطلاع القراءة في المجموعة.")
     except Exception as e:
@@ -330,6 +379,12 @@ async def send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await do_send_part(context)
 
+async def questions_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    idx = get_today_day_index()
+    await send_day_questions(context, idx)
+
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
@@ -339,9 +394,9 @@ async def skip_part(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     state = get_state()
-    state["next_part_index"] += 1
+    state["day_offset"] = state.get("day_offset", 0) + 1
     save_state(state)
-    await update.message.reply_text(f"تم التخطي. الجزء القادم الآن: {state['next_part_index']}")
+    await update.message.reply_text(f"تم التخطي. يوم اليوم أصبح: {get_today_day_index()}")
 
 async def skip_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -381,6 +436,58 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
              for uid, info in responses.items()]
     await update.message.reply_text("نتائج آخر استطلاع:\n" + "\n".join(lines))
 
+# ---------- ask an admin (private reply via the bot) ----------
+
+ASK_USAGE = "استخدم: /ask متبوعًا بسؤالك، مثال:\n/ask هل هناك جلسة نقاش هذا الأسبوع؟"
+ASK_RECEIVED_GROUP = "✅ تم إرسال سؤالك، سيصلك الرد في الخاص من البوت قريبًا."
+ASK_NEED_START_GROUP = (
+    "⚠️ لإرسال الرد لك في الخاص، افتح محادثة خاصة مع البوت أولًا (@{bot_username})، "
+    "أرسل /start هناك، ثم أعد إرسال سؤالك هنا بـ /ask."
+)
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = update.message.text.partition(" ")[2].strip()
+    user = update.effective_user
+    if not question:
+        await update.message.reply_text(ASK_USAGE)
+        return
+    try:
+        await context.bot.send_message(
+            user.id, f"📩 سؤالك:\n{question}\n\nسيصلك الرد هنا قريبًا بإذن الله."
+        )
+    except Exception:
+        bot_username = context.bot.username
+        await update.message.reply_text(ASK_NEED_START_GROUP.format(bot_username=bot_username))
+        return
+    try:
+        await context.bot.send_message(
+            OWNER_ID,
+            f"❓ سؤال جديد من {user.full_name} (@{user.username or 'بدون يوزر'}):\n{question}\n\n"
+            f"للرد: /reply {user.id} نص الرد",
+        )
+    except Exception:
+        pass
+    await update.message.reply_text(ASK_RECEIVED_GROUP)
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    parts = update.message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await update.message.reply_text("استخدم: /reply <user_id> <نص الرد>")
+        return
+    _, uid_str, reply_text = parts
+    try:
+        uid = int(uid_str)
+    except ValueError:
+        await update.message.reply_text("معرف المستخدم غير صحيح.")
+        return
+    try:
+        await context.bot.send_message(uid, f"💬 رد من المشرف:\n{reply_text}")
+        await update.message.reply_text("✅ تم إرسال الرد.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ تعذر إرسال الرد: {e}")
+
 # ---------- main ----------
 
 def parse_hhmm(s):
@@ -394,12 +501,15 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("send_now", send_now))
+    app.add_handler(CommandHandler("questions_now", questions_now))
     app.add_handler(CommandHandler("poll_now", poll_now))
     app.add_handler(CommandHandler("skip_part", skip_part))
     app.add_handler(CommandHandler("skip_today", skip_today))
     app.add_handler(CommandHandler("reminder_now", reminder_now))
     app.add_handler(CommandHandler("set_livestream", set_livestream))
     app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("ask", ask_command))
+    app.add_handler(CommandHandler("reply", reply_command))
     app.add_handler(CommandHandler("faq", faq_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, faq_watch))
     app.add_handler(PollAnswerHandler(poll_answer))
