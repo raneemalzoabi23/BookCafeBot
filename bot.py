@@ -37,6 +37,7 @@ ALL_TARGETS = [t for t in [GROUP_ID, CHANNEL_ID] if t]
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
 POLL_TIME = os.environ.get("POLL_TIME", "20:00")
+QUESTIONS_TIME = os.environ.get("QUESTIONS_TIME", "").strip()  # empty/unset = send right after the part, as before
 # The date day 1 was (or will be) sent. Day number is computed from today's
 # date relative to this, so progress survives redeploys — nothing is "counted"
 # or stored that could get reset.
@@ -111,7 +112,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة المفهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعة قناة جمعية النعيم للتعليم. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -348,7 +349,10 @@ async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
     for f in attachments:
         await send_file_to_group(context, f)
 
-    await send_day_questions(context, idx)
+    if not QUESTIONS_TIME:
+        # No separate time configured — keep the old behavior of sending
+        # questions right after the part itself.
+        await send_day_questions(context, idx)
 
     formats = ", ".join(sorted({f.suffix.lower().lstrip(".") for f in files}))
     await notify_owner(context, f"✅ تم نشر الجزء {idx} ({formats}) في المجموعة.")
@@ -434,6 +438,11 @@ async def send_part_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_poll_job(context: ContextTypes.DEFAULT_TYPE):
     await do_send_poll(context)
+
+async def questions_job(context: ContextTypes.DEFAULT_TYPE):
+    idx = get_today_day_index()
+    if idx >= 1:
+        await send_day_questions(context, idx)
 
 async def send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -577,6 +586,8 @@ def main():
 
     app.job_queue.run_daily(send_part_job, time=parse_hhmm(SEND_TIME))
     app.job_queue.run_daily(send_poll_job, time=parse_hhmm(POLL_TIME))
+    if QUESTIONS_TIME:
+        app.job_queue.run_daily(questions_job, time=parse_hhmm(QUESTIONS_TIME))
 
     if REMINDER_DAY in DAY_NAME_TO_INT:
         app.job_queue.run_daily(
@@ -586,9 +597,10 @@ def main():
     else:
         reminder_status = "reminder disabled"
 
+    questions_status = f"questions at {QUESTIONS_TIME}" if QUESTIONS_TIME else "questions right after parts"
     log.info(
-        "Bot started. Posting to group %s. Parts at %s, polls at %s, %s (%s)",
-        GROUP_ID, SEND_TIME, POLL_TIME, reminder_status, TIMEZONE,
+        "Bot started. Posting to group %s. Parts at %s, polls at %s, %s, %s (%s)",
+        GROUP_ID, SEND_TIME, POLL_TIME, questions_status, reminder_status, TIMEZONE,
     )
     app.run_polling()
 
