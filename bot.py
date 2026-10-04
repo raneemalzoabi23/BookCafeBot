@@ -31,6 +31,8 @@ def parse_chat_id(raw: str):
 
 
 GROUP_ID = parse_chat_id(os.environ["GROUP_ID"])
+CHANNEL_ID = parse_chat_id(os.environ["CHANNEL_ID"].strip()) if os.environ.get("CHANNEL_ID", "").strip() else None
+ALL_TARGETS = [t for t in [GROUP_ID, CHANNEL_ID] if t]
 
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
@@ -44,7 +46,7 @@ DAY_NAME_TO_INT = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6,
 }
-REMINDER_DAY = os.environ.get("REMINDER_DAY", "friday").lower()
+REMINDER_DAY = os.environ.get("REMINDER_DAY", "").strip().lower()  # empty/unset = reminder disabled
 REMINDER_TIME = os.environ.get("REMINDER_TIME", "20:00")
 CONTACT_NUMBER = os.environ.get("CONTACT_NUMBER", "").strip()
 
@@ -109,7 +111,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة النقهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعة المفهى الثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -143,53 +145,89 @@ def get_questions_for_day(idx):
             return entry.get("questions", [])
     return []
 
+ARABIC_LETTER_LABELS = ["أ", "ب", "ت", "ث", "ج", "ح", "خ", "د"]
+
+async def _send_one_quiz(context, chat_id, is_anonymous, raw_question, raw_options, correct):
+    too_long = len(raw_question) > 300 or any(len(o) > 100 for o in raw_options)
+    if too_long:
+        labels = ARABIC_LETTER_LABELS[: len(raw_options)]
+        lines = [f"❓ {raw_question}", ""]
+        lines += [f"{labels[i]}) {opt}" for i, opt in enumerate(raw_options)]
+        await context.bot.send_message(chat_id, "\n".join(lines))
+        await context.bot.send_poll(
+            chat_id=chat_id,
+            question="اختر الإجابة الصحيحة (بحسب الخيارات أعلاه):",
+            options=labels,
+            type=Poll.QUIZ,
+            correct_option_id=correct,
+            is_anonymous=is_anonymous,
+        )
+    else:
+        await context.bot.send_poll(
+            chat_id=chat_id,
+            question=raw_question,
+            options=raw_options,
+            type=Poll.QUIZ,
+            correct_option_id=correct,
+            is_anonymous=is_anonymous,
+        )
+
 async def send_day_questions(context: ContextTypes.DEFAULT_TYPE, idx: int):
     questions = get_questions_for_day(idx)
     if not questions:
         return
     sent = 0
     for q in questions:
-        options = [str(o)[:100] for o in q.get("options", [])]
+        raw_question = str(q.get("question", ""))
+        raw_options = [str(o) for o in q.get("options", [])]
         correct = q.get("correct_index")
-        if len(options) < 2 or correct is None or correct >= len(options):
+        if len(raw_options) < 2 or correct is None or correct >= len(raw_options):
             continue
         try:
-            await context.bot.send_poll(
-                chat_id=GROUP_ID,
-                question=str(q["question"])[:300],
-                options=options,
-                type=Poll.QUIZ,
-                correct_option_id=correct,
-                is_anonymous=False,
-            )
+            # Group: non-anonymous (tracked). Channel: must be anonymous (Telegram rule).
+            await _send_one_quiz(context, GROUP_ID, False, raw_question, raw_options, correct)
+            if CHANNEL_ID:
+                await _send_one_quiz(context, CHANNEL_ID, True, raw_question, raw_options, correct)
             sent += 1
-            await asyncio.sleep(1)  # avoid flooding the group / hitting rate limits
+            await asyncio.sleep(1)  # avoid flooding / rate limits
         except Exception as e:
-            log.warning(f"Failed to send quiz question to group: {e}")
+            log.warning(f"Failed to send quiz question: {e}")
     if sent:
         await notify_owner(context, f"📝 تم إرسال {sent} سؤال/أسئلة مراجعة للجزء {idx}.")
 
 async def send_file_to_group(context: ContextTypes.DEFAULT_TYPE, path: Path):
+    """Sends one attachment to every configured target (group and/or channel).
+    Uploads once and reuses the resulting file_id for the rest, instead of
+    re-uploading the whole file per target."""
     size_mb = path.stat().st_size / (1024 * 1024)
     if size_mb > MAX_FILE_MB:
         await notify_owner(context, FILE_TOO_LARGE_OWNER.format(name=path.name, limit=MAX_FILE_MB))
         return False
     ext = path.suffix.lower()
     data = path.read_bytes()
-    try:
-        if ext == ".pdf":
-            await context.bot.send_document(GROUP_ID, document=data, filename=path.name)
-        elif ext in AUDIO_EXTS:
-            await context.bot.send_audio(
-                GROUP_ID, audio=data, filename=path.name, title=f"جزء {_part_number(path)}"
-            )
-        else:
-            return False
-        return True
-    except Exception as e:
-        log.warning(f"Failed to send {path.name} to group: {e}")
-        await notify_owner(context, f"⚠️ فشل إرسال {path.name} إلى المجموعة.")
-        return False
+    file_id = None
+    ok = False
+    for chat_id in ALL_TARGETS:
+        try:
+            source = file_id if file_id else data
+            if ext == ".pdf":
+                msg = await context.bot.send_document(
+                    chat_id, document=source, filename=path.name if not file_id else None
+                )
+                file_id = file_id or msg.document.file_id
+            elif ext in AUDIO_EXTS:
+                msg = await context.bot.send_audio(
+                    chat_id, audio=source, filename=path.name if not file_id else None,
+                    title=f"جزء {_part_number(path)}",
+                )
+                file_id = file_id or msg.audio.file_id
+            else:
+                continue
+            ok = True
+        except Exception as e:
+            log.warning(f"Failed to send {path.name} to {chat_id}: {e}")
+            await notify_owner(context, f"⚠️ فشل إرسال {path.name} إلى {chat_id}.")
+    return ok
 
 # ---------- fallback if someone DMs the bot directly ----------
 
@@ -275,10 +313,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     idx = get_today_day_index()
+    targets = f"المجموعة: {GROUP_ID}" + (f"\nالقناة: {CHANNEL_ID}" if CHANNEL_ID else "")
     await update.message.reply_text(
         f"يوم اليوم: {idx}\n"
         f"إجمالي الأيام المتوفرة: {len(get_day_numbers())}\n"
-        f"المجموعة: {GROUP_ID}"
+        f"{targets}"
     )
 
 async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
@@ -295,11 +334,15 @@ async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
     header = f"📖 جزء اليوم ({idx})"
     message = f"{header}:\n\n{text_file.read_text(encoding='utf-8')}" if text_file else header
 
-    try:
-        await context.bot.send_message(GROUP_ID, message)
-    except Exception as e:
-        log.warning(f"Failed to post part to group: {e}")
-        await notify_owner(context, f"⚠️ فشل نشر الجزء {idx} في المجموعة. تأكد أن البوت عضو فيها ولديه صلاحية الإرسال.")
+    sent_ok = False
+    for chat_id in ALL_TARGETS:
+        try:
+            await context.bot.send_message(chat_id, message)
+            sent_ok = True
+        except Exception as e:
+            log.warning(f"Failed to post part to {chat_id}: {e}")
+            await notify_owner(context, f"⚠️ فشل نشر الجزء {idx} في {chat_id}. تأكد أن البوت عضو/مشرف فيها ولديه صلاحية الإرسال.")
+    if not sent_ok:
         return
 
     for f in attachments:
@@ -313,18 +356,32 @@ async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
 async def do_send_poll(context: ContextTypes.DEFAULT_TYPE):
     state = get_state()
     try:
+        # Group: non-anonymous so we can track who answered (used by /report)
         msg = await context.bot.send_poll(
             chat_id=GROUP_ID,
             question=POLL_QUESTION,
             options=POLL_OPTIONS,
-            is_anonymous=False,  # groups allow this, so we can track who answered
+            is_anonymous=False,
         )
         state["active_polls"] = {str(msg.poll.id): {"part_index": get_today_day_index()}}
         save_state(state)
-        await notify_owner(context, "✅ تم نشر استطلاع القراءة في المجموعة.")
     except Exception as e:
         log.warning(f"Failed to post poll to group: {e}")
         await notify_owner(context, "⚠️ فشل نشر الاستطلاع في المجموعة.")
+        return
+    if CHANNEL_ID:
+        try:
+            # Channels only allow anonymous polls — a Telegram platform rule
+            await context.bot.send_poll(
+                chat_id=CHANNEL_ID,
+                question=POLL_QUESTION,
+                options=POLL_OPTIONS,
+                is_anonymous=True,
+            )
+        except Exception as e:
+            log.warning(f"Failed to post poll to channel: {e}")
+            await notify_owner(context, "⚠️ فشل نشر الاستطلاع في القناة.")
+    await notify_owner(context, "✅ تم نشر استطلاع القراءة.")
 
 def get_reminder_text():
     if REMINDER_FILE.exists():
@@ -333,12 +390,16 @@ def get_reminder_text():
 
 async def do_send_reminder(context: ContextTypes.DEFAULT_TYPE):
     message = REMINDER_HEADER + get_reminder_text()
-    try:
-        await context.bot.send_message(GROUP_ID, message)
-        await notify_owner(context, "✅ تم نشر تذكير البث المباشر في المجموعة.")
-    except Exception as e:
-        log.warning(f"Failed to post reminder to group: {e}")
-        await notify_owner(context, "⚠️ فشل نشر تذكير البث المباشر في المجموعة.")
+    sent_ok = False
+    for chat_id in ALL_TARGETS:
+        try:
+            await context.bot.send_message(chat_id, message)
+            sent_ok = True
+        except Exception as e:
+            log.warning(f"Failed to post reminder to {chat_id}: {e}")
+            await notify_owner(context, f"⚠️ فشل نشر تذكير البث المباشر في {chat_id}.")
+    if sent_ok:
+        await notify_owner(context, "✅ تم نشر تذكير البث المباشر.")
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     await do_send_reminder(context)
@@ -517,12 +578,17 @@ def main():
     app.job_queue.run_daily(send_part_job, time=parse_hhmm(SEND_TIME))
     app.job_queue.run_daily(send_poll_job, time=parse_hhmm(POLL_TIME))
 
-    reminder_day_int = DAY_NAME_TO_INT.get(REMINDER_DAY, 4)
-    app.job_queue.run_daily(reminder_job, time=parse_hhmm(REMINDER_TIME), days=(reminder_day_int,))
+    if REMINDER_DAY in DAY_NAME_TO_INT:
+        app.job_queue.run_daily(
+            reminder_job, time=parse_hhmm(REMINDER_TIME), days=(DAY_NAME_TO_INT[REMINDER_DAY],)
+        )
+        reminder_status = f"reminder {REMINDER_DAY} at {REMINDER_TIME}"
+    else:
+        reminder_status = "reminder disabled"
 
     log.info(
-        "Bot started. Posting to group %s. Parts at %s, polls at %s, reminder %s at %s (%s)",
-        GROUP_ID, SEND_TIME, POLL_TIME, REMINDER_DAY, REMINDER_TIME, TIMEZONE,
+        "Bot started. Posting to group %s. Parts at %s, polls at %s, %s (%s)",
+        GROUP_ID, SEND_TIME, POLL_TIME, reminder_status, TIMEZONE,
     )
     app.run_polling()
 
