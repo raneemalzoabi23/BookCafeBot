@@ -34,6 +34,18 @@ GROUP_ID = parse_chat_id(os.environ["GROUP_ID"])
 CHANNEL_ID = parse_chat_id(os.environ["CHANNEL_ID"].strip()) if os.environ.get("CHANNEL_ID", "").strip() else None
 ALL_TARGETS = [t for t in [GROUP_ID, CHANNEL_ID] if t]
 
+# Optional: post into one specific Topic inside the group (forum-mode groups only).
+# Get this value by sending /topic_id inside the desired topic.
+_topic_raw = os.environ.get("TOPIC_ID", "").strip()
+GROUP_THREAD_ID = int(_topic_raw) if _topic_raw.isdigit() else None
+
+def thread_kwargs(chat_id):
+    """Adds message_thread_id only for the group, and only if TOPIC_ID is set.
+    Channels don't have topics, so this never applies there."""
+    if chat_id == GROUP_ID and GROUP_THREAD_ID:
+        return {"message_thread_id": GROUP_THREAD_ID}
+    return {}
+
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
 POLL_TIME = os.environ.get("POLL_TIME", "20:00")
@@ -60,6 +72,7 @@ RESPONSES_FILE = DATA_DIR / "responses.json"
 REMINDER_FILE = DATA_DIR / "livestream_reminder.txt"
 FAQ_FILE = BASE_DIR / "faq.json"  # lives in the repo, edited via GitHub like parts/
 QUESTIONS_FILE = BASE_DIR / "questions.json"  # discussion/quiz questions per part
+
 
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".oga"}
 MAX_FILE_MB = 49  # Telegram bots can't upload files larger than ~50MB
@@ -112,7 +125,7 @@ def get_day_files(idx):
 
 START_TEXT = (
     "مرحبًا! 📚 هذا البوت ينشر أجزاء الكتاب والملفات الصوتية واستطلاعات القراءة "
-    "مباشرة داخل مجموعة قناة جمعية النعيم للتعليم. انضم إلى المجموعة لمتابعة كل شيء هناك."
+    "مباشرة داخل مجموعة مقهى ثقافي. انضم إلى المجموعة لمتابعة كل شيء هناك."
 )
 POLL_QUESTION = "هل قرأت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته", "📖 لا أزال أقرأه", "❌ لم أبدأ بعد"]
@@ -154,7 +167,7 @@ async def _send_one_quiz(context, chat_id, is_anonymous, raw_question, raw_optio
         labels = ARABIC_LETTER_LABELS[: len(raw_options)]
         lines = [f"❓ {raw_question}", ""]
         lines += [f"{labels[i]}) {opt}" for i, opt in enumerate(raw_options)]
-        await context.bot.send_message(chat_id, "\n".join(lines))
+        await context.bot.send_message(chat_id, "\n".join(lines), **thread_kwargs(chat_id))
         await context.bot.send_poll(
             chat_id=chat_id,
             question="اختر الإجابة الصحيحة (بحسب الخيارات أعلاه):",
@@ -162,6 +175,7 @@ async def _send_one_quiz(context, chat_id, is_anonymous, raw_question, raw_optio
             type=Poll.QUIZ,
             correct_option_id=correct,
             is_anonymous=is_anonymous,
+            **thread_kwargs(chat_id),
         )
     else:
         await context.bot.send_poll(
@@ -171,6 +185,7 @@ async def _send_one_quiz(context, chat_id, is_anonymous, raw_question, raw_optio
             type=Poll.QUIZ,
             correct_option_id=correct,
             is_anonymous=is_anonymous,
+            **thread_kwargs(chat_id),
         )
 
 async def send_day_questions(context: ContextTypes.DEFAULT_TYPE, idx: int):
@@ -213,13 +228,15 @@ async def send_file_to_group(context: ContextTypes.DEFAULT_TYPE, path: Path):
             source = file_id if file_id else data
             if ext == ".pdf":
                 msg = await context.bot.send_document(
-                    chat_id, document=source, filename=path.name if not file_id else None
+                    chat_id, document=source, filename=path.name if not file_id else None,
+                    **thread_kwargs(chat_id),
                 )
                 file_id = file_id or msg.document.file_id
             elif ext in AUDIO_EXTS:
                 msg = await context.bot.send_audio(
                     chat_id, audio=source, filename=path.name if not file_id else None,
                     title=f"جزء {_part_number(path)}",
+                    **thread_kwargs(chat_id),
                 )
                 file_id = file_id or msg.audio.file_id
             else:
@@ -310,6 +327,17 @@ async def faq_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- owner-only handlers ----------
 
+async def topic_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    tid = update.message.message_thread_id
+    if tid:
+        await update.message.reply_text(
+            f"معرف هذا الموضوع (Topic): {tid}\nضعه كقيمة لمتغير TOPIC_ID في Railway."
+        )
+    else:
+        await update.message.reply_text("هذه ليست داخل Topic محدد (أو الموضوعات غير مفعّلة هنا).")
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
@@ -338,7 +366,7 @@ async def do_send_part(context: ContextTypes.DEFAULT_TYPE):
     sent_ok = False
     for chat_id in ALL_TARGETS:
         try:
-            await context.bot.send_message(chat_id, message)
+            await context.bot.send_message(chat_id, message, **thread_kwargs(chat_id))
             sent_ok = True
         except Exception as e:
             log.warning(f"Failed to post part to {chat_id}: {e}")
@@ -366,6 +394,7 @@ async def do_send_poll(context: ContextTypes.DEFAULT_TYPE):
             question=POLL_QUESTION,
             options=POLL_OPTIONS,
             is_anonymous=False,
+            **thread_kwargs(GROUP_ID),
         )
         state["active_polls"] = {str(msg.poll.id): {"part_index": get_today_day_index()}}
         save_state(state)
@@ -397,7 +426,7 @@ async def do_send_reminder(context: ContextTypes.DEFAULT_TYPE):
     sent_ok = False
     for chat_id in ALL_TARGETS:
         try:
-            await context.bot.send_message(chat_id, message)
+            await context.bot.send_message(chat_id, message, **thread_kwargs(chat_id))
             sent_ok = True
         except Exception as e:
             log.warning(f"Failed to post reminder to {chat_id}: {e}")
@@ -570,6 +599,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("topic_id", topic_id))
     app.add_handler(CommandHandler("send_now", send_now))
     app.add_handler(CommandHandler("questions_now", questions_now))
     app.add_handler(CommandHandler("poll_now", poll_now))
