@@ -4,7 +4,7 @@ import re
 import asyncio
 import logging
 import unicodedata
-from datetime import time, date
+from datetime import time, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -50,10 +50,17 @@ TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Riyadh"))
 SEND_TIME = os.environ.get("SEND_TIME", "09:00")
 POLL_TIME = os.environ.get("POLL_TIME", "20:00")
 QUESTIONS_TIME = os.environ.get("QUESTIONS_TIME", "").strip()  # empty/unset = send right after the part, as before
-# The date day 1 was (or will be) sent. Day number is computed from today's
-# date relative to this, so progress survives redeploys — nothing is "counted"
-# or stored that could get reset.
+# (Old setting, no longer used for counting days. Kept so existing env vars don't break.)
 START_DATE = date.fromisoformat(os.environ.get("START_DATE", str(date.today())).strip())
+
+# ---- Rest days: Friday and Saturday ----
+# Day numbers are counted only on non-rest days, starting from a fixed anchor:
+# on ANCHOR_DATE (a Sunday) the bot sends part ANCHOR_PART, then keeps going in
+# order on Sun-Thu only. On Fri/Sat it sends only REST_DAY_TEXT.
+REST_WEEKDAYS = {4, 5}  # Python weekday(): Monday=0 ... Friday=4, Saturday=5, Sunday=6
+ANCHOR_DATE = date.fromisoformat(os.environ.get("ANCHOR_DATE", "2026-10-11").strip())
+ANCHOR_PART = int(os.environ.get("ANCHOR_PART", "6"))
+REST_DAY_TEXT = "اليوم مراجعة واستدراك، متابعة طيبة 🌿"
 
 DAY_NAME_TO_INT = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -91,17 +98,29 @@ def save_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def get_state():
-    return load_json(STATE_FILE, {"day_offset": 0, "active_polls": {}, "skip_next_auto_send": False})
+    return load_json(STATE_FILE, {"part_offset": 0, "active_polls": {}, "skip_next_auto_send": False})
 
 def save_state(state):
     save_json(STATE_FILE, state)
 
+def today_local():
+    return datetime.now(TIMEZONE).date()
+
+def is_rest_day():
+    return today_local().weekday() in REST_WEEKDAYS
+
 def get_today_day_index():
-    """Day number is always derived from today's date + START_DATE, plus any
-    manual offset from /skip_part. Never a stored counter, so it can't reset."""
-    today = date.today()
-    state = get_state()
-    return (today - START_DATE).days + 1 + state.get("day_offset", 0)
+    """Counts only non-rest days (Sun-Thu) from ANCHOR_DATE, plus any manual
+    offset from /skip_part. Never a stored counter, so it can't reset.
+    On Fri/Sat it returns the last part that was sent."""
+    today = today_local()
+    n = 0
+    d = ANCHOR_DATE
+    while d <= today:
+        if d.weekday() not in REST_WEEKDAYS:
+            n += 1
+        d += timedelta(days=1)
+    return ANCHOR_PART - 1 + n + get_state().get("part_offset", 0)
 
 def _part_number(path: Path):
     m = re.search(r"part[-_](\d+)", path.stem)
@@ -456,7 +475,17 @@ async def set_livestream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     REMINDER_FILE.write_text(text, encoding="utf-8")
     await update.message.reply_text("تم تحديث نص تذكير البث المباشر ✅")
 
+async def send_rest_day_message(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id in ALL_TARGETS:
+        try:
+            await context.bot.send_message(chat_id, REST_DAY_TEXT, **thread_kwargs(chat_id))
+        except Exception as e:
+            log.warning(f"Failed to post rest-day message to {chat_id}: {e}")
+
 async def send_part_job(context: ContextTypes.DEFAULT_TYPE):
+    if is_rest_day():
+        await send_rest_day_message(context)
+        return
     state = get_state()
     if state.get("skip_next_auto_send"):
         state["skip_next_auto_send"] = False
@@ -466,9 +495,13 @@ async def send_part_job(context: ContextTypes.DEFAULT_TYPE):
     await do_send_part(context)
 
 async def send_poll_job(context: ContextTypes.DEFAULT_TYPE):
+    if is_rest_day():
+        return
     await do_send_poll(context)
 
 async def questions_job(context: ContextTypes.DEFAULT_TYPE):
+    if is_rest_day():
+        return
     idx = get_today_day_index()
     if idx >= 1:
         await send_day_questions(context, idx)
@@ -493,7 +526,7 @@ async def skip_part(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     state = get_state()
-    state["day_offset"] = state.get("day_offset", 0) + 1
+    state["part_offset"] = state.get("part_offset", 0) + 1
     save_state(state)
     await update.message.reply_text(f"تم التخطي. يوم اليوم أصبح: {get_today_day_index()}")
 
