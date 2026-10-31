@@ -58,8 +58,8 @@ START_DATE = date.fromisoformat(os.environ.get("START_DATE", str(date.today())).
 # on ANCHOR_DATE (a Sunday) the bot sends part ANCHOR_PART, then keeps going in
 # order on Sun-Thu only. On Fri/Sat it sends only REST_DAY_TEXT.
 REST_WEEKDAYS = {4, 5}  # Python weekday(): Monday=0 ... Friday=4, Saturday=5, Sunday=6
-ANCHOR_DATE = date.fromisoformat(os.environ.get("ANCHOR_DATE", "2026-10-11").strip())
-ANCHOR_PART = int(os.environ.get("ANCHOR_PART", "6"))
+ANCHOR_DATE = date.fromisoformat(os.environ.get("ANCHOR_DATE", "2026-11-01").strip())
+ANCHOR_PART = int(os.environ.get("ANCHOR_PART", "1"))
 REST_DAY_TEXT = "اليوم مراجعة واستدراك، متابعة طيبة 🌿"
 
 DAY_NAME_TO_INT = {
@@ -123,7 +123,7 @@ def get_today_day_index():
     return ANCHOR_PART - 1 + n + get_state().get("part_offset", 0)
 
 def _part_number(path: Path):
-    m = re.search(r"part[-_](\d+)", path.stem)
+    m = re.search(r"part[-_]?(\d+)", path.stem)
     return int(m.group(1)) if m else None
 
 def get_all_part_files():
@@ -148,6 +148,7 @@ START_TEXT = (
 )
 POLL_QUESTION = "هل قرأت أو سمعت الجزء الذي تم نشره اليوم؟"
 POLL_OPTIONS = ["✅ نعم، قرأته / سمعته", "📖 لا أزال أقرأه / أسمعه", "❌ لم أبدأ بعد"]
+QUESTION_PREFIX = "سؤال اليوم هو:"
 NO_PARTS_LEFT_OWNER = "⚠️ لا توجد أجزاء متبقية لنشرها. أضف ملفات جديدة في مجلد parts/."
 FILE_TOO_LARGE_OWNER = "⚠️ الملف {name} حجمه أكبر من {limit}MB، لم يتم إرساله. قلل حجم الملف وحاول مرة أخرى."
 DEFAULT_REMINDER_TEXT = "سيتم تحديد تفاصيل موعد ورابط البث المباشر قريبًا. تابعوا هنا للتحديثات."
@@ -213,6 +214,17 @@ async def send_day_questions(context: ContextTypes.DEFAULT_TYPE, idx: int):
         return
     sent = 0
     for q in questions:
+        # Written (open) question: no options, sent as a normal message to everyone
+        if q.get("text"):
+            message = f"{QUESTION_PREFIX}\n\n{q['text']}"
+            try:
+                for chat_id in ALL_TARGETS:
+                    await context.bot.send_message(chat_id, message, **thread_kwargs(chat_id))
+                sent += 1
+                await asyncio.sleep(1)
+            except Exception as e:
+                log.warning(f"Failed to send written question: {e}")
+            continue
         raw_question = str(q.get("question", ""))
         raw_options = [str(o) for o in q.get("options", [])]
         correct = q.get("correct_index")
