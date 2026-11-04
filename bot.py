@@ -7,7 +7,7 @@ import unicodedata
 from datetime import time, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
+from spam_filter import setup_spam_filter
 from dotenv import load_dotenv
 from telegram import Update, Poll
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, PollAnswerHandler, ContextTypes
@@ -640,6 +640,8 @@ def parse_hhmm(s):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    setup_spam_filter(app, GROUP_ID, OWNER_ID)
+
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
