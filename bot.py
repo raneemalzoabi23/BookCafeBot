@@ -509,6 +509,9 @@ async def send_part_job(context: ContextTypes.DEFAULT_TYPE):
 async def send_poll_job(context: ContextTypes.DEFAULT_TYPE):
     if is_rest_day():
         return
+    idx = get_today_day_index()
+    if idx < 1 or not get_day_files(idx):
+        return #no part today so no poll
     await do_send_poll(context)
 
 async def questions_job(context: ContextTypes.DEFAULT_TYPE):
